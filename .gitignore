@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+scan_cache.json
+results/
+*.egg-info/
+.venv/

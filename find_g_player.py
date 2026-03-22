@@ -1,28 +1,31 @@
 #!/usr/bin/env python3
 """
-F76 g_player Pointer Finder — signature scan the .text section for RIP-relative
-references to g_player (a static pointer to PlayerCharacter* in .data).
+FO76 g_player Pointer Finder
+
+Scans the .text section for RIP-relative references to g_player, a static
+pointer to PlayerCharacter* stored in .data. This finds the g_player global
+variable address across game updates without hardcoded offsets.
 
 Strategy:
-  1. Parse /proc/PID/maps to find executable (.text) and writable (.data) regions
-  2. Scan .text for `mov reg, [rip+disp32]` patterns
+  1. Parse PE section headers from /proc/PID/mem
+  2. Scan .text for `mov reg, [rip+disp32]` and `lea reg, [rip+disp32]`
   3. Calculate target addresses in .data
   4. Group by target, rank by reference count
   5. For each candidate: read ptr, check for FormID 0x14 at +0x38
   6. Verify by reading position twice with movement check
 
 Usage:
-  python3 -m src.find_g_player          # auto-detect PID
-  python3 -m src.find_g_player <PID>    # specify PID
+    python3 find_g_player.py              # auto-detect PID
+    python3 find_g_player.py --pid 12345  # specify PID
 
 IMPORTANT: Player must be MOVING in-game during the verification phase!
 
 Known offsets for FO76 1.7.x:
-  - FormID at +0x38 (confirmed, shifted from +0x30)
-  - Position (NiPoint3) at +0xD0 (from F76SE, but may have shifted)
-  - Old g_player RVA: 0x05ADD3D8 (stale for 1.7.23.39)
+  - FormID at +0x38 (confirmed)
+  - Position (NiPoint3) at +0xD0 (approximate, may shift between builds)
 """
 
+import argparse
 import struct
 import sys
 import os
@@ -35,16 +38,22 @@ from pathlib import Path
 from datetime import datetime
 
 IMAGE_BASE = 0x140000000
-OLD_GPLAYER_RVA = 0x05ADD3D8
-POSITION_OFFSET = 0xD0  # NiPoint3 offset in PlayerCharacter (may have shifted)
-FORMID_OFFSET = 0x38     # FormID offset (confirmed for 1.7.23.39)
+POSITION_OFFSET = 0xD0   # NiPoint3 offset in PlayerCharacter
+FORMID_OFFSET = 0x38      # FormID offset (confirmed for 1.7.23.39)
 
-OUTPUT_DIR = Path(__file__).parent.parent / "data"
+OUTPUT_DIR = Path(__file__).parent / "results"
 
 
-def find_game():
+def find_game_pid():
     """Find FO76 PID (largest RSS Fallout76 process)."""
-    result = subprocess.run(["pgrep", "-af", "Fallout76"], capture_output=True, text=True, timeout=5)
+    try:
+        result = subprocess.run(
+            ["pgrep", "-af", "Fallout76"],
+            capture_output=True, text=True, timeout=5,
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return None
+
     best_pid, best_rss = None, 0
     for line in result.stdout.strip().split("\n"):
         if not line.strip():
@@ -54,24 +63,25 @@ def find_game():
         except (ValueError, IndexError):
             continue
         try:
-            for sl in open(f"/proc/{pid}/status"):
-                if sl.startswith("VmRSS:"):
-                    rss = int(sl.split()[1])
-                    if rss > best_rss and rss > 1000000:
-                        best_rss = rss
-                        best_pid = pid
-        except:
+            with open(f"/proc/{pid}/status") as f:
+                for sl in f:
+                    if sl.startswith("VmRSS:"):
+                        rss = int(sl.split()[1])
+                        if rss > best_rss and rss > 1000000:
+                            best_rss = rss
+                            best_pid = pid
+        except (OSError, ValueError):
             pass
     return best_pid
 
 
-def parse_pe_sections(mem):
+def parse_pe_sections(mem, base_addr):
     """Read PE section headers from the image base."""
-    mem.seek(IMAGE_BASE)
+    mem.seek(base_addr)
     dos = mem.read(0x40)
     e_lfanew = struct.unpack_from('<I', dos, 0x3C)[0]
 
-    mem.seek(IMAGE_BASE + e_lfanew)
+    mem.seek(base_addr + e_lfanew)
     pe_sig = mem.read(4)
     assert pe_sig == b'PE\x00\x00', f"Bad PE signature: {pe_sig}"
 
@@ -79,7 +89,7 @@ def parse_pe_sections(mem):
     num_sections = struct.unpack_from('<H', coff, 2)[0]
     opt_header_size = struct.unpack_from('<H', coff, 16)[0]
 
-    mem.seek(IMAGE_BASE + e_lfanew + 4 + 20 + opt_header_size)
+    mem.seek(base_addr + e_lfanew + 4 + 20 + opt_header_size)
 
     sections = {}
     for _ in range(num_sections):
@@ -89,9 +99,9 @@ def parse_pe_sections(mem):
         vaddr = struct.unpack_from('<I', sec, 12)[0]
         chars = struct.unpack_from('<I', sec, 36)[0]
         sections[name] = {
-            'va': IMAGE_BASE + vaddr,
+            'va': base_addr + vaddr,
             'vsize': vsize,
-            'end': IMAGE_BASE + vaddr + vsize,
+            'end': base_addr + vaddr + vsize,
             'chars': chars,
         }
     return sections
@@ -133,9 +143,6 @@ def scan_rip_relative_refs(mem, text_regions, data_start, data_end):
                0x25: 'r12', 0x2D: 'r13', 0x35: 'r14', 0x3D: 'r15'},
     }
 
-    total_bytes = sum(end - start for start, end in text_regions)
-    bytes_scanned = 0
-
     for region_start, region_end in text_regions:
         size = region_end - region_start
         try:
@@ -174,13 +181,11 @@ def scan_rip_relative_refs(mem, text_regions, data_start, data_end):
             if len(target_refs[target]) < 10:
                 target_refs[target].append((instr_addr, reg, opname))
 
-        bytes_scanned += size
-
     return target_counter, target_refs
 
 
 def read_ptr(mem, addr):
-    """Read a 64-bit pointer at addr. Returns 0 on error."""
+    """Read a 64-bit pointer at addr."""
     try:
         mem.seek(addr)
         return struct.unpack('<Q', mem.read(8))[0]
@@ -189,7 +194,7 @@ def read_ptr(mem, addr):
 
 
 def read_floats(mem, addr, count=3):
-    """Read count floats at addr. Returns None on error."""
+    """Read count floats at addr."""
     try:
         mem.seek(addr)
         return struct.unpack(f'<{count}f', mem.read(4 * count))
@@ -198,7 +203,7 @@ def read_floats(mem, addr, count=3):
 
 
 def read_uint32(mem, addr):
-    """Read a uint32 at addr. Returns None on error."""
+    """Read a uint32 at addr."""
     try:
         mem.seek(addr)
         return struct.unpack('<I', mem.read(4))[0]
@@ -231,18 +236,15 @@ def check_candidate(mem, data_addr, rdata_start=None, rdata_end=None):
         'ptr': ptr,
     }
 
-    # Check vtable
     vtable = read_ptr(mem, ptr)
     result['vtable'] = vtable
     if rdata_start and rdata_end:
         result['vtable_in_rdata'] = rdata_start <= vtable < rdata_end
 
-    # Check FormID at +0x38
     formid = read_uint32(mem, ptr + FORMID_OFFSET)
     result['formid'] = formid
     result['is_player_form'] = (formid == 0x14)
 
-    # Check position at +0xD0
     pos = read_floats(mem, ptr + POSITION_OFFSET)
     if pos:
         x, y, z = pos
@@ -278,16 +280,13 @@ def verify_movement(mem, candidates, wait_time=3):
     Read position from candidates twice with a delay.
     Returns candidates with movement data added.
     """
-    # First read
     readings = {}
     for c in candidates:
         ptr = c['ptr']
-        # Try standard offset
         pos = read_floats(mem, ptr + POSITION_OFFSET)
         if pos:
             readings[c['data_addr']] = {'pos': pos, 'offset': POSITION_OFFSET}
 
-        # Also try alt positions
         for alt in c.get('alt_positions', []):
             off = alt['offset']
             pos = read_floats(mem, ptr + off)
@@ -296,10 +295,9 @@ def verify_movement(mem, candidates, wait_time=3):
                 readings[key] = {'pos': pos, 'offset': off, 'data_addr': c['data_addr']}
 
     print(f"  First read: {len(readings)} position readings")
-    print(f"  Waiting {wait_time}s — MOVE YOUR CHARACTER IN-GAME!")
+    print(f"  Waiting {wait_time}s -- MOVE YOUR CHARACTER IN-GAME!")
     time.sleep(wait_time)
 
-    # Second read
     results = []
     for c in candidates:
         ptr = c['ptr']
@@ -318,7 +316,7 @@ def verify_movement(mem, candidates, wait_time=3):
 
             x1, y1, z1 = r['pos']
             x2, y2, z2 = pos2
-            dist = math.sqrt((x2-x1)**2 + (y2-y1)**2 + (z2-z1)**2)
+            dist = math.sqrt((x2 - x1)**2 + (y2 - y1)**2 + (z2 - z1)**2)
 
             if dist > 0.1:
                 results.append({
@@ -338,12 +336,13 @@ def verify_movement(mem, candidates, wait_time=3):
 
 
 def main():
-    # Get PID
-    if len(sys.argv) > 1:
-        pid = int(sys.argv[1])
-    else:
-        pid = find_game()
+    parser = argparse.ArgumentParser(
+        description="Find g_player (PlayerCharacter*) pointer in FO76 process memory"
+    )
+    parser.add_argument("--pid", type=int, help="Game PID (auto-detected if omitted)")
+    args = parser.parse_args()
 
+    pid = args.pid or find_game_pid()
     if not pid:
         print("ERROR: FO76 not running! Start the game first.")
         sys.exit(1)
@@ -353,17 +352,16 @@ def main():
         sys.exit(1)
 
     print("=" * 70)
-    print("F76 g_player POINTER FINDER")
+    print("FO76 g_player POINTER FINDER")
     print("=" * 70)
     print(f"PID: {pid}")
     print(f"Image base: 0x{IMAGE_BASE:X}")
-    print(f"Old g_player RVA: 0x{OLD_GPLAYER_RVA:X}")
     print()
 
     mem = open(f"/proc/{pid}/mem", "rb")
 
     # Read PE sections
-    sections = parse_pe_sections(mem)
+    sections = parse_pe_sections(mem, IMAGE_BASE)
     data_sec = sections['.data']
     rdata_sec = sections['.rdata']
     text_sec = sections['.text']
@@ -373,14 +371,11 @@ def main():
     print(f".data:  0x{data_sec['va']:X} - 0x{data_sec['end']:X} ({data_sec['vsize']/(1024*1024):.1f} MB)")
     print()
 
-    # Get executable regions from maps
     text_regions = parse_maps(pid)
     text_total = sum(e - s for s, e in text_regions)
     print(f"Executable regions: {len(text_regions)} ({text_total/(1024*1024):.1f} MB)")
 
-    # ================================================================
-    # Phase 1: Scan .text for RIP-relative references into .data
-    # ================================================================
+    # Phase 1: Scan for RIP-relative references
     print("\n" + "=" * 70)
     print("PHASE 1: Scanning .text for RIP-relative references to .data...")
     print("-" * 70)
@@ -388,36 +383,14 @@ def main():
     target_counter, target_refs = scan_rip_relative_refs(
         mem, text_regions, data_sec['va'], data_sec['end']
     )
-
     print(f"\nFound {len(target_counter)} unique .data targets referenced from .text")
 
-    # ================================================================
-    # Phase 2: Check old g_player address
-    # ================================================================
+    # Phase 2: Check top candidates for FormID 0x14
     print("\n" + "=" * 70)
-    print("PHASE 2: Old g_player check...")
-    print("-" * 70)
-
-    old_addr = IMAGE_BASE + OLD_GPLAYER_RVA
-    ref_count = target_counter.get(old_addr, 0)
-    print(f"Old RVA 0x{OLD_GPLAYER_RVA:X} — {ref_count} refs from .text")
-
-    old_result = check_candidate(mem, old_addr, rdata_sec['va'], rdata_sec['end'])
-    if old_result:
-        print(f"  ptr=0x{old_result['ptr']:X}, formid=0x{old_result.get('formid', 0):X}")
-        if old_result.get('position'):
-            p = old_result['position']
-            print(f"  position: ({p['x']:.2f}, {p['y']:.2f}, {p['z']:.2f})")
-
-    # ================================================================
-    # Phase 3: Top candidates by ref count — check for FormID 0x14
-    # ================================================================
-    print("\n" + "=" * 70)
-    print("PHASE 3: Checking top .data targets for FormID 0x14...")
+    print("PHASE 2: Checking top .data targets for FormID 0x14...")
     print("-" * 70)
 
     top_targets = target_counter.most_common(500)
-
     player_candidates = []
     all_valid = []
 
@@ -429,7 +402,6 @@ def main():
 
         if result.get('is_player_form'):
             player_candidates.append(result)
-
         if result.get('valid_position') or result.get('alt_positions'):
             all_valid.append(result)
 
@@ -440,14 +412,10 @@ def main():
         if c.get('position'):
             p = c['position']
             print(f"    pos@+0xD0: ({p['x']:.2f}, {p['y']:.2f}, {p['z']:.2f})")
-        for alt in c.get('alt_positions', [])[:5]:
-            print(f"    pos@+0x{alt['offset']:X}: ({alt['x']:.2f}, {alt['y']:.2f}, {alt['z']:.2f})")
 
-    # ================================================================
-    # Phase 4: Broader search — scan ALL .data for FormID 0x14
-    # ================================================================
+    # Phase 3: Full .data scan for FormID 0x14
     print("\n" + "=" * 70)
-    print("PHASE 4: Full .data scan for pointers to FormID 0x14 objects...")
+    print("PHASE 3: Full .data scan for pointers to FormID 0x14 objects...")
     print("-" * 70)
 
     mem.seek(data_sec['va'])
@@ -463,7 +431,6 @@ def main():
             continue
 
         data_addr = data_sec['va'] + i
-        # Skip if already found
         if any(c['data_addr'] == data_addr for c in player_candidates):
             continue
 
@@ -477,20 +444,13 @@ def main():
         rva = c['rva']
         refs = c['ref_count']
         print(f"  RVA 0x{rva:X} ({refs} refs) -> 0x{c['ptr']:X}, vtable=0x{c.get('vtable', 0):X}")
-        if c.get('position'):
-            p = c['position']
-            print(f"    pos@+0xD0: ({p['x']:.2f}, {p['y']:.2f}, {p['z']:.2f})")
-        for alt in c.get('alt_positions', [])[:3]:
-            print(f"    pos@+0x{alt['offset']:X}: ({alt['x']:.2f}, {alt['y']:.2f}, {alt['z']:.2f})")
 
-    # ================================================================
-    # Phase 5: Movement verification
-    # ================================================================
+    # Phase 4: Movement verification
     candidates_to_verify = player_candidates if player_candidates else all_valid[:50]
 
     if candidates_to_verify:
         print("\n" + "=" * 70)
-        print("PHASE 5: Movement verification (3 second window)...")
+        print("PHASE 4: Movement verification (3 second window)...")
         print("*** MOVE YOUR CHARACTER IN-GAME NOW! ***")
         print("-" * 70)
 
@@ -507,7 +467,6 @@ def main():
                 print(f"    After:  ({p2['x']:.2f}, {p2['y']:.2f}, {p2['z']:.2f})")
                 print(f"    Movement: {m['movement']:.2f} game units")
 
-            # Best candidate
             best = moved[0]
             print(f"\n{'=' * 70}")
             print(f"BEST g_player CANDIDATE:")
@@ -521,7 +480,6 @@ def main():
             print(f"  Movement:      {best['movement']:.2f} units")
             print(f"  Current pos:   ({best['pos2']['x']:.2f}, {best['pos2']['y']:.2f}, {best['pos2']['z']:.2f})")
 
-            # Show code references
             target_addr = best['data_addr']
             if target_addr in target_refs:
                 print(f"\n  Code references from .text:")
@@ -533,11 +491,9 @@ def main():
     else:
         print("\nNo candidates to verify.")
 
-    # ================================================================
-    # Phase 6: Top reference summary
-    # ================================================================
+    # Phase 5: Reference summary
     print("\n" + "=" * 70)
-    print("TOP 20 .data TARGETS BY REFERENCE COUNT (for manual analysis):")
+    print("TOP 20 .data TARGETS BY REFERENCE COUNT:")
     print("-" * 70)
 
     for i, (addr, count) in enumerate(top_targets[:20]):
@@ -553,7 +509,7 @@ def main():
             formid = read_uint32(mem, ptr + FORMID_OFFSET)
 
         fid_str = f" formid=0x{formid:X}" if formid is not None else ""
-        print(f"  #{i+1:2d}: RVA 0x{rva:X} — {count:5d} refs — ptr={ptr_str}{fid_str} — {ref_str}")
+        print(f"  #{i+1:2d}: RVA 0x{rva:X} -- {count:5d} refs -- ptr={ptr_str}{fid_str} -- {ref_str}")
 
     # Save results
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -563,7 +519,6 @@ def main():
         "timestamp": datetime.now().isoformat(),
         "pid": pid,
         "image_base": f"0x{IMAGE_BASE:X}",
-        "old_g_player_rva": f"0x{OLD_GPLAYER_RVA:X}",
         "sections": {
             name: {"va": f"0x{s['va']:X}", "end": f"0x{s['end']:X}", "vsize": s['vsize']}
             for name, s in sections.items()
