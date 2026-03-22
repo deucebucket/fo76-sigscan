@@ -6,11 +6,13 @@ Addresses shift with every game update. Signature scanning is version-independen
 
 ## What it does
 
-- **scanner.py** -- Scans FO76 process memory for 36 known function signatures across 7 categories (Scaleform/Papyrus VM, PlayerCharacter, Actor, TESDataHandler, ProcessLists, TESForm, Inventory/ActorValue). Reports the absolute address and RVA for each match.
+- **scanner.py** -- Linux scanner. Reads FO76 process memory via `/proc/PID/mem` and scans for 36 known function signatures across 7 categories (Scaleform/Papyrus VM, PlayerCharacter, Actor, TESDataHandler, ProcessLists, TESForm, Inventory/ActorValue). Reports the absolute address and RVA for each match.
 
-- **find_g_player.py** -- Finds the `g_player` global variable (a `PlayerCharacter*` pointer in `.data`) by scanning `.text` for RIP-relative `mov`/`lea` instructions that reference `.data` addresses, then verifying candidates by checking for FormID `0x14` and detecting player movement.
+- **scanner_windows.py** -- Windows scanner. Same patterns and scanning logic, but uses `kernel32.ReadProcessMemory` via ctypes instead of `/proc/PID/mem`. Discovers module base via `EnumProcessModulesEx` and process PID via `tasklist`. Includes a `--test` mode for verifying the memory reading pipeline against any running process. Zero external dependencies.
 
-Both tools are **read-only** -- they only read `/proc/PID/mem` and never modify game memory.
+- **find_g_player.py** -- Finds the `g_player` global variable (a `PlayerCharacter*` pointer in `.data`) by scanning `.text` for RIP-relative `mov`/`lea` instructions that reference `.data` addresses, then verifying candidates by checking for FormID `0x14` and detecting player movement. Linux only.
+
+All tools are **read-only** -- they never modify game memory.
 
 ## How it works
 
@@ -104,11 +106,21 @@ The tool also discovers RTTI class name strings embedded in the binary, which he
 ## Requirements
 
 - Python 3.8+
-- Linux (reads `/proc/PID/mem` directly)
-- Fallout 76 running under Proton or Wine
 - No additional Python packages required (stdlib only)
 
+### Linux (`scanner.py`)
+- Reads `/proc/PID/mem` directly
+- Fallout 76 running under Proton or Wine
+
+### Windows (`scanner_windows.py`)
+- Uses Win32 API (`kernel32.ReadProcessMemory`) via ctypes -- no external dependencies
+- Fallout 76 running natively
+- May need to run as Administrator for process access
+- Includes `--test` mode to verify memory reading against any process (e.g. `explorer.exe`)
+
 ## Usage
+
+### Linux
 
 ```bash
 # Scan for all 36 function signatures
@@ -122,6 +134,23 @@ python3 scanner.py --no-cache
 
 # Find g_player pointer (move your character during verification!)
 python3 find_g_player.py
+```
+
+### Windows
+
+```cmd
+:: Scan for all 36 function signatures
+python scanner_windows.py
+
+:: With verbose logging
+python scanner_windows.py -v
+
+:: Force rescan (ignore cache)
+python scanner_windows.py --no-cache
+
+:: Test mode: verify memory reading works (no FO76 needed)
+python scanner_windows.py --test
+python scanner_windows.py --test notepad.exe
 ```
 
 ## Example output
