@@ -12,6 +12,10 @@ Addresses shift with every game update. Signature scanning is version-independen
 
 - **find_g_player.py** -- Finds the `g_player` global variable (a `PlayerCharacter*` pointer in `.data`) by scanning `.text` for RIP-relative `mov`/`lea` instructions that reference `.data` addresses, then verifying candidates by checking for FormID `0x14` and detecting player movement. Linux only.
 
+- **tools/** -- Address auto-update pipeline. Where the 36 hand-tuned scanner patterns above need re-tuning every time Bethesda patches the game, the tools in `tools/` rebuild a `name → retail_rva` map for **10,000+ named functions** automatically by combining a dev-build signature scanner (`wildcard_scanner.py`) with an RTTI vtable cross-mapper (`vtable_mapper.py`). See [tools/README.md](tools/README.md) for the pipeline and how to run it after a patch.
+
+- **data/** -- Inputs and outputs for the auto-update pipeline. Includes `dev_build_signatures.json` (5,408 named-function byte signatures captured from the dev build) and `address_library.json` (the regenerated `name → retail_rva` map for the current build).
+
 All tools are **read-only** -- they never modify game memory.
 
 ## How it works
